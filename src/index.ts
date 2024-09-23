@@ -1,86 +1,125 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
+export class SeatBooking extends DurableObject {
+	private seats: Map<string, boolean> = new Map();
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.toml`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+	sql = this.ctx.storage.sql;
 
-
-/**
- * Associate bindings declared in wrangler.toml with the TypeScript type system
- */
-export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	MY_DURABLE_OBJECT: DurableObjectNamespace<MyDurableObject>;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
-}
-
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
+	constructor(state: DurableObjectState, env: Env) {
+		super(state, env);
+		this.initializeSeats();
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	private initializeSeats() {
+		const cursor = this.sql.exec(`PRAGMA table_list`);
+
+		// Check if a table exists.
+		if ([...cursor][0].name === 'seats') {
+			console.log('Table already exists');
+			return;
+		}
+
+		this.sql.exec(`
+				  CREATE TABLE IF NOT EXISTS seats (
+					seatId TEXT PRIMARY KEY,
+					occupant TEXT
+				  )
+				`);
+
+		// For this demo, we populate the table with 60 seats.
+		for (let row = 1; row <= 10; row++) {
+			for (let col = 0; col < 6; col++) {
+				const seatNumber = `${row}${String.fromCharCode(65 + col)}`;
+				this.sql.exec(`INSERT INTO seats VALUES (?, null)`, seatNumber);
+			}
+		}
+	}
+
+	// Assign passenger to a seat.
+	assignSeat(seatId: string, occupant: string) {
+		// Check that seat isn't occupied.
+		let cursor = this.sql.exec(`SELECT occupant FROM seats WHERE seatId = ?`, seatId);
+		let result = [...cursor][0]; // Get the first result from the cursor.
+
+		if (!result) {
+			return new Response('Seat not available', { status: 400 });
+		}
+		if (result.occupant !== null) {
+			return new Response('Seat not available', { status: 400 });
+		}
+
+		// If the occupant is already in a different seat, remove them.
+		this.sql.exec(`UPDATE seats SET occupant = null WHERE occupant = ?`, occupant);
+
+		// Assign the seat. Note: We don't have to worry that a concurrent request may
+		// have grabbed the seat between the two queries, because the code is synchronous
+		// (no `await`s) and the database is private to this Durable Object. Nothing else
+		// could have changed since we checked that the seat was available earlier!
+		this.sql.exec(`UPDATE seats SET occupant = ? WHERE seatId = ?`, occupant, seatId);
+
+		// Broadcast the updated seats.
+		this.broadcastSeats();
+		return new Response(`Seat ${seatId} booked successfully`);
+	}
+
+	// Get all seats.
+	private getSeats() {
+		let results = [];
+
+		// Query returns a cursor.
+		let cursor = this.sql.exec(`SELECT seatId, occupant FROM seats`);
+
+		// Cursors are iterable.
+		for (let row of cursor) {
+			// Each row is an object with a property for each column.
+			results.push({ seatNumber: row.seatId, occupant: row.occupant });
+		}
+
+		return JSON.stringify(results);
+	}
+
+	private handleWebSocket(request: Request) {
+		console.log('WebSocket connection requested');
+		const [client, server] = Object.values(new WebSocketPair());
+
+		this.ctx.acceptWebSocket(server);
+		console.log('WebSocket connection established');
+		console.log(this.ctx.getWebSockets);
+
+		return new Response(null, { status: 101, webSocket: client });
+	}
+
+	private broadcastSeats() {
+		this.ctx.getWebSockets().forEach((ws) => ws.send(this.getSeats()));
+	}
+
+	async fetch(request: Request) {
+		const url = new URL(request.url);
+
+		if (request.method === 'GET' && url.pathname === '/seats') {
+			return new Response(JSON.stringify(this.getSeats()), { headers: { 'Content-Type': 'application/json' } });
+		} else if (request.method === 'POST' && url.pathname === '/book-seat') {
+			const { seatNumber, name } = (await request.json()) as { seatNumber: string; name: string };
+			return this.assignSeat(seatNumber, name);
+		} else if (request.headers.get('Upgrade') === 'websocket') {
+			return this.handleWebSocket(request);
+		}
+
+		return new Response('Not found', { status: 404 });
 	}
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
 	async fetch(request, env, ctx): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
+		// Get flight id from the query parameter
+		const url = new URL(request.url);
+		const flightId = url.searchParams.get('flightId');
 
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
+		if (!flightId) {
+			return new Response('Flight ID not found', { status: 404 });
+		}
 
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
-
-		return new Response(greeting);
+		const id = env.SEAT_BOOKING.idFromName(flightId);
+		const stub = env.SEAT_BOOKING.get(id);
+		return stub.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;
